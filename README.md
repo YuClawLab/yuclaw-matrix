@@ -2,111 +2,146 @@
 
 # YUCLAW-MATRIX
 
-**CRT Lock-Free Concurrent Scheduler**
+**CRT-Based Concurrent Scheduler — Research Preview**
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Hardware](https://img.shields.io/badge/hardware-DGX_Spark_GB10-green)
-![Algorithm](https://img.shields.io/badge/algorithm-Lock--Free_CRT-purple)
+![Algorithm](https://img.shields.io/badge/algorithm-CRT_scheduling-purple)
+![Status](https://img.shields.io/badge/status-research_preview-orange)
 ![License](https://img.shields.io/badge/license-MIT-red)
 
-> High-performance task scheduler for parallel financial computation. Bridging the ancient mathematical principles of the 3rd-century *Sunzi Suanjing* with modern GPU architecture to achieve 15x faster throughput than standard threading at 1,000+ concurrent instruments.
+> Concurrent task scheduler for financial tick processing. Uses the Chinese
+> Remainder Theorem (Sun Zi's *Suanjing*, ~279 CE) to route work across
+> instruments without mutexes. Includes an arXiv-style paper and a simulated
+> benchmark on NVIDIA DGX Spark.
 
 </div>
 
 ---
 
-## Overview
-
-**Yuclaw-Matrix** serves as the ultra-low latency concurrency backbone of the YUCLAW ATROS system. Traditional multithreading in Python and C++ suffers from mutex contention and lock-based bottlenecks during high-frequency parallel execution.
-
-Matrix bypasses this entirely by utilizing Chinese Remainder Theorem (CRT) mathematics for deterministic, lock-free work distribution. It seamlessly schedules parallel LLM inference, market data ingestion, and portfolio computations across heterogeneous hardware (NVIDIA GPU + CPU) without traditional locking.
-
----
-
-## Key Features
-
-- **Mathematical Lock-Free Scheduling:** CRT-based workload distribution guarantees zero-collision task routing, entirely eliminating mutex contention and thread-blocking.
-- **15x Throughput Multiplier:** Rigorously benchmarked against native Python `threading`, demonstrating extreme latency reduction at 1,000+ instrument loads.
-- **Hardware-Aware Routing:** Intelligently profiles tasks and routes compute-heavy workloads to CUDA cores and I/O tasks to CPU threads.
-- **Dynamic Backpressure:** Adaptive rate-limiting and memory monitoring prevent GPU Out-of-Memory (OOM) errors during volatile market burst loads.
-- **Zero-Copy IPC:** Utilizes shared memory buffers between the LLM inference engine and quantitative post-processing, bypassing expensive memory serialization.
+> **Status — research preview**
+> This repository contains the scheduling algorithm, a simulated benchmark,
+> and a working paper. The scheduler is **not currently used in the active
+> YUCLAW production cron**; the live pipeline in
+> [yuclaw-brain](https://github.com/YuClawLab/yuclaw-brain) uses a simpler
+> sequential engine refresh. This repo is published as research output and as
+> a reference implementation for the paper.
 
 ---
 
-## The CRT Mathematical Advantage
+## What this repo contains
 
-Unlike round-robin or randomized task distribution, Matrix assigns execution slots by solving simultaneous congruences derived from prime moduli assigned to worker pools. For a system of independent tasks across worker modules, the scheduler finds the unique lock-free execution index:
+| File | Purpose | LOC |
+|---|---|---:|
+| `yuclaw_matrix/scheduler.py` | CRT scheduler + benchmark harness | 395 |
+| `yuclaw_matrix/live_feed.py` | Finnhub websocket + yfinance polling adapters | 235 |
+| `paper/crt_arxiv.tex` + `crt_arxiv.md` | Working paper (LaTeX + Markdown) | — |
+| `paper/submission/main.pdf` | Compiled 60 KB PDF | — |
+| `docs/benchmark_weekend.json` | Raw benchmark data | — |
+| `docs/benchmark_dgx_spark.md` | Benchmark write-up | — |
 
-```
-x = a_1 (mod m_1)
-x = a_2 (mod m_2)
-...
-x = a_k (mod m_k)
-```
-
-This O(1) routing guarantees no two threads ever attempt to access the same memory address simultaneously, achieving theoretical maximum hardware utilization.
+Total: **633 lines of Python** + working paper.
 
 ---
 
-## System Architecture
-```mermaid
-graph TD;
-    subgraph Matrix [CRT Scheduler Core]
-        direction TB
-        A[Incoming Tasks: LLM Data Math] --> Core{CRT Distribution}
-    end
+## The algorithm
 
-    Core -->|Compute| GPU[GPU Pool - CUDA/Tensor]
-    Core -->|Logic| CPU[CPU Pool - x86/ARM64]
-    Core -->|Network| IO[IO Pool - FIX/REST]
+The Chinese Remainder Theorem guarantees that for pairwise coprime moduli
+`m_1, m_2, ..., m_k`, the system of congruences `x ≡ a_i (mod m_i)` has a
+unique solution modulo `M = m_1 · m_2 · ... · m_k`.
 
-    GPU --> WS((Lock-Free Work Stealing Queues))
-    CPU --> WS
-    IO --> WS
+**Applied to scheduling**: each instrument gets a unique prime modulus. Two
+instruments A (mod `p`) and B (mod `q`) are co-active only when `t ≡ 0 (mod
+p·q)`. Since `p·q >> max(p, q)`, simultaneous activations are rare, and
+because each instrument only ever writes its own state, no mutex is needed.
+
+```python
+# scheduler.py:117 — the entire scheduling decision per tick per instrument
+def is_active(self, tick: int) -> bool:
+    return tick % self.prime == 0
 ```
+
+Expected number of active instruments at any tick `t`:
+
+```
+E[active(t)] = Σ 1/p_i  ≈  N / ln(p_N)    (Mertens' theorem)
+```
+
+At `N=1000` (so `p_1000 = 7919`): `E[active] ≈ 111` per tick — about 11% of
+the universe at any given moment.
+
+---
+
+## Benchmark — simulated workload
+
+> **Methodology disclosure**
+> The benchmark in `scheduler.py:312-355` simulates each instrument fetch with
+> a hardcoded `await asyncio.sleep(0.001)` — a fixed 1 ms fake network round
+> trip. **The measured latencies are scheduling overhead on top of that
+> simulated 1 ms, not end-to-end production trading latency.** Real-world
+> performance depends on the actual data feed, broker, and downstream pipeline.
+
+### Single-machine NVIDIA DGX Spark (GB10 Grace Blackwell, 128 GB unified memory, ARM64)
+
+Raw data in [`docs/benchmark_weekend.json`](docs/benchmark_weekend.json):
+
+| Instruments | p50 latency (ms) | p95 (ms) | p99 (ms) |
+|---:|---:|---:|---:|
+| 50 | 1.08 | 1.12 | 1.99 |
+| 100 | 1.08 | 1.15 | 2.00 |
+| 300 | 1.09 | 1.33 | 3.12 |
+| 1,000 | 1.11 | 1.12 | 2.00 |
+| 3,000 | 1.18 | 1.20 | 2.00 |
+| 10,000 | 1.41 | 2.32 | 3.91 |
+
+**Observation**: scheduling overhead stays at roughly 1.1–1.4 ms p50 from
+N=50 to N=10,000. That is the cost of the CRT dispatch loop itself,
+*not* the cost of doing real work for each instrument. This demonstrates
+that the scheduler adds **O(1) overhead per active instrument** — it does
+not become the bottleneck as the universe grows.
+
+It does **not** mean a real trading system reaches the market in 1.4 ms.
 
 ---
 
 ## Usage
+
 ```python
-from yuclaw_matrix import Scheduler
+from yuclaw_matrix import CRTScheduler
 import asyncio
 
-# Initialize with hardware-aware worker pools
-sched = Scheduler(gpu_workers=1, cpu_workers=8)
+async def fetch_price(ticker: str) -> float:
+    # Your real price fetch goes here
+    ...
 
-async def analyze(ticker: str):
-    return await llm.complete(f"Analyze {ticker}")
+sched = CRTScheduler(["AAPL", "MSFT", "NVDA", "..."])
+await sched.run(fetch_price, max_ticks=1000)
+```
 
-async def main():
-    tickers = ["AAPL", "MSFT", "NVDA"]  # Scale to 1,000+ instruments
-    results = await sched.map(analyze, tickers)
-    print(f"Processed {len(results)} assets.")
+Reproduce the benchmark yourself:
 
-if __name__ == "__main__":
-    asyncio.run(main())
+```bash
+git clone https://github.com/YuClawLab/yuclaw-matrix
+cd yuclaw-matrix
+python3 yuclaw_matrix/scheduler.py
 ```
 
 ---
 
-## Performance Benchmarks
+## Working paper
 
-Tested on NVIDIA DGX Spark GB10 processing standard ATROS portfolio loads.
+`paper/crt_arxiv.tex` is a draft paper (~10 pages) covering:
 
-| Concurrency Level | Native threading (s) | Yuclaw-Matrix (s) | Speedup |
-|:---|:---:|:---:|:---:|
-| 100 Instruments | 12.4 | 2.1 | **5.9x** |
-| 500 Instruments | 58.7 | 4.8 | **12.2x** |
-| 1,000 Instruments | 124.3 | 8.2 | **15.2x** |
+1. Mathematical foundation (CRT, prime sieve)
+2. Algorithm and proof of lock-freedom
+3. Simulated benchmark on DGX Spark
+4. Discussion of related scheduling approaches
 
----
+Compiled PDF: `paper/submission/main.pdf` (60 KB).
 
-## Academic Paper
-
-**CRT Lock-Free Concurrent Scheduler for Financial Systems**
-SSRN Abstract #6461418 | DGX Spark GB10 | 1.37ms latency
-
-[Read the full paper on SSRN](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6461418)
+The paper has not been formally submitted to arXiv at the time of writing
+this README. SSRN abstract [#6461418](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=6461418)
+is the related preprint covering the broader YUCLAW system.
 
 ---
 
@@ -114,16 +149,28 @@ SSRN Abstract #6461418 | DGX Spark GB10 | 1.37ms latency
 
 | | |
 |:---|:---|
-| Dashboard | [yuclawlab.github.io/yuclaw-brain](https://yuclawlab.github.io/yuclaw-brain) |
+| Production pipeline | [yuclaw-brain](https://github.com/YuClawLab/yuclaw-brain) |
+| Live dashboard | [yuclawlab.github.io/yuclaw-brain](https://yuclawlab.github.io/yuclaw-brain) |
 | PyPI | [pypi.org/project/yuclaw](https://pypi.org/project/yuclaw) |
 | GitHub | [YuClawLab](https://github.com/YuClawLab) |
 
 ---
 
+## Disclaimer
+
+YUCLAW is open-source research and educational software. **It is NOT financial
+advice or a recommendation to buy or sell any security.** Numbers in this
+README come from a simulated benchmark on a single machine and do not
+constitute a claim about real-world trading latency. Past performance — of
+either the algorithm or any trading strategy built on it — does not predict
+future results.
+
+For educational and research purposes only. MIT Licensed.
+
+---
+
 <div align="center">
 
-MIT License — free for everyone.
-
-*Built on NVIDIA DGX Spark GB10 · Nemotron 3 Super 120B · Zero cloud dependency*
+*Built on NVIDIA DGX Spark GB10 · MIT*
 
 </div>
